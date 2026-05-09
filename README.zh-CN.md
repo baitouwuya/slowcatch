@@ -23,7 +23,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr https://raw.githubus
 固定安装某个版本：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((iwr https://raw.githubusercontent.com/baitouwuya/slowcatch/master/scripts/install-codex-hook.ps1 -UseB).Content)) -Version v0.1.1"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((iwr https://raw.githubusercontent.com/baitouwuya/slowcatch/master/scripts/install-codex-hook.ps1 -UseB).Content)) -Version v0.1.2"
 ```
 
 安装脚本会从 latest release 下载

@@ -1,6 +1,12 @@
+mod mini;
+
 use crate::backends::everything::FindQuery;
 use crate::backends::grep::{GrepContextQuery, GrepQuery};
-use crate::backends::projection::{FindProjection, MetadataField, Projection, ReadOnlyExternal};
+use crate::backends::projection::{
+    FileField, FileSort, FileWhere, FindMeasure, FindPipeline, FindProjection, MeasureKind,
+    MetadataField, Projection, ReadOnlyExternal,
+};
+pub use mini::{MiniCondition, MiniScript, TestPathType};
 use regex::Regex;
 use std::path::PathBuf;
 use tree_sitter::Parser;
@@ -9,6 +15,12 @@ use tree_sitter::Parser;
 pub enum FastOperation {
     Find(FindQuery),
     FindProjection(FindProjection),
+    FindPipeline(FindPipeline),
+    FindMeasure(FindMeasure),
+    DirectProjection {
+        paths: Vec<String>,
+        projection: Projection,
+    },
     Grep(GrepQuery),
     GrepContext(GrepContextQuery),
     InspectFile {
@@ -21,6 +33,7 @@ pub enum FastOperation {
         first: usize,
     },
     CommandList(Vec<FastSegment>),
+    MiniScript(MiniScript),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,9 +102,21 @@ pub fn classify_powershell(command: &str, cwd: Option<&str>) -> ParseDecision {
         .as_deref()
         .is_some_and(|command| !is_interesting_file_command(command))
     {
+        if let Some(operation) = mini::parse_mini_script(trimmed, cwd) {
+            return ParseDecision::Fast(operation);
+        }
         return ParseDecision::PassThrough(PassThroughReason::ExternalProgram);
     }
+    if let Some(operation) = mini::parse_mini_script(trimmed, cwd) {
+        return ParseDecision::Fast(operation);
+    }
     if let Some(operation) = parse_find_projection(trimmed, cwd) {
+        return ParseDecision::Fast(operation);
+    }
+    if let Some(operation) = parse_find_pipeline(trimmed, cwd) {
+        return ParseDecision::Fast(operation);
+    }
+    if let Some(operation) = parse_find_measure(trimmed, cwd) {
         return ParseDecision::Fast(operation);
     }
     if !is_valid_powershell_ast(trimmed) {
@@ -142,14 +167,14 @@ fn is_valid_powershell_ast(command: &str) -> bool {
             .unwrap_or(false)
 }
 
-fn has_dynamic_or_unsafe_constructs(command: &str) -> bool {
+pub(super) fn has_dynamic_or_unsafe_constructs(command: &str) -> bool {
     let lowered = command.to_lowercase();
     ["$(", "`", "invoke-expression", "iex"]
         .iter()
         .any(|token| lowered.contains(token))
 }
 
-fn is_mutating_command(command: &str, first_command: Option<&str>) -> bool {
+pub(super) fn is_mutating_command(command: &str, first_command: Option<&str>) -> bool {
     if command.contains(">>") || command.contains('>') {
         return true;
     }
@@ -179,7 +204,7 @@ fn is_mutating_command(command: &str, first_command: Option<&str>) -> bool {
     })
 }
 
-fn is_external_program_command(command: &str) -> bool {
+pub(super) fn is_external_program_command(command: &str) -> bool {
     matches!(
         command,
         "git"
@@ -207,7 +232,7 @@ fn is_external_program_command(command: &str) -> bool {
         || command.starts_with('.')
 }
 
-fn is_interesting_file_command(command: &str) -> bool {
+pub(super) fn is_interesting_file_command(command: &str) -> bool {
     matches!(
         command,
         "get-childitem"
@@ -295,7 +320,7 @@ fn normalized_shape(command: &str) -> String {
         .join(" | ")
 }
 
-fn normalize_command_name(command: &str) -> String {
+pub(super) fn normalize_command_name(command: &str) -> String {
     command
         .trim_matches('&')
         .trim_matches('"')
@@ -324,7 +349,7 @@ fn parse_get_child_item_find(command: &str, cwd: Option<&str>) -> Option<FastOpe
     let pattern = parsed.filter.or(parsed.include)?;
 
     Some(FastOperation::Find(FindQuery {
-        root: parsed.root,
+        root: parsed.roots.into_iter().next(),
         pattern,
         files_only: true,
         limit: 80,
@@ -353,7 +378,7 @@ fn parse_command_list(command: &str, cwd: Option<&str>) -> Option<FastOperation>
     Some(FastOperation::CommandList(segments))
 }
 
-fn classify_single_command(command: &str, cwd: Option<&str>) -> ParseDecision {
+pub(super) fn classify_single_command(command: &str, cwd: Option<&str>) -> ParseDecision {
     let trimmed = command.trim();
     if has_dynamic_or_unsafe_constructs(trimmed) {
         return ParseDecision::PassThrough(PassThroughReason::DynamicOrUnsafe);
@@ -368,6 +393,12 @@ fn classify_single_command(command: &str, cwd: Option<&str>) -> ParseDecision {
         return ParseDecision::Fast(operation);
     }
     if let Some(operation) = parse_find_projection(trimmed, cwd) {
+        return ParseDecision::Fast(operation);
+    }
+    if let Some(operation) = parse_find_pipeline(trimmed, cwd) {
+        return ParseDecision::Fast(operation);
+    }
+    if let Some(operation) = parse_find_measure(trimmed, cwd) {
         return ParseDecision::Fast(operation);
     }
     if let Some(operation) = parse_get_child_item_list(trimmed, cwd) {
@@ -386,7 +417,8 @@ fn classify_single_command(command: &str, cwd: Option<&str>) -> ParseDecision {
 }
 
 fn parse_select_string(command: &str, cwd: Option<&str>) -> Option<FastOperation> {
-    if command.contains('|') {
+    let pipeline_parts = split_pipeline(command)?;
+    if pipeline_parts.len() > 1 {
         return parse_gci_select_string_pipeline(command, cwd);
     }
 
@@ -419,7 +451,15 @@ fn parse_select_string(command: &str, cwd: Option<&str>) -> Option<FastOperation
             "-simplematch" => simple_match = true,
             "-context" => {
                 index += 1;
-                context = Some(parse_context(tokens.get(index)?)?);
+                let value = tokens.get(index)?;
+                if let Some(next) = tokens.get(index + 1)
+                    && next.starts_with(',')
+                {
+                    context = Some(parse_context(&format!("{value}{next}"))?);
+                    index += 1;
+                } else {
+                    context = Some(parse_context(value)?);
+                }
             }
             value if value.starts_with('-') => return None,
             _ => positional.push(tokens[index].clone()),
@@ -593,7 +633,11 @@ fn parse_gci_select_string_pipeline(command: &str, cwd: Option<&str>) -> Option<
     if !parsed.recurse {
         return None;
     }
-    let root = parsed.root.or_else(|| cwd.map(ToOwned::to_owned))?;
+    let root = parsed
+        .roots
+        .into_iter()
+        .next()
+        .or_else(|| cwd.map(ToOwned::to_owned))?;
     let pattern = parse_select_string_pattern(&right[1..])?;
     Some(FastOperation::Grep(GrepQuery {
         roots: vec![PathBuf::from(root)],
@@ -616,7 +660,10 @@ fn parse_find_projection(command: &str, cwd: Option<&str>) -> Option<FastOperati
     if parts.len() == 3 {
         let format_tokens = tokenize(parts[2])?;
         let format_name = format_tokens.first()?.to_lowercase();
-        if !matches!(format_name.as_str(), "format-table" | "ft") {
+        if !matches!(
+            format_name.as_str(),
+            "format-table" | "ft" | "format-list" | "fl"
+        ) {
             return None;
         }
     }
@@ -632,9 +679,19 @@ fn parse_find_projection(command: &str, cwd: Option<&str>) -> Option<FastOperati
     }
     let parsed = parse_gci_options(&left[1..], cwd)?;
     let projection = parse_select_projection(&select[1..])?;
+    if !parsed.recurse
+        && parsed.roots.len() > 1
+        && parsed.filter.is_none()
+        && parsed.include.is_none()
+    {
+        return Some(FastOperation::DirectProjection {
+            paths: parsed.roots,
+            projection,
+        });
+    }
     Some(FastOperation::FindProjection(FindProjection {
         query: FindQuery {
-            root: parsed.root,
+            root: parsed.roots.into_iter().next(),
             pattern: parsed
                 .filter
                 .or(parsed.include)
@@ -643,6 +700,119 @@ fn parse_find_projection(command: &str, cwd: Option<&str>) -> Option<FastOperati
             limit: 200,
         },
         projection,
+    }))
+}
+
+fn parse_find_pipeline(command: &str, cwd: Option<&str>) -> Option<FastOperation> {
+    let mut parts = split_pipeline(command)?;
+    if parts.len() < 3 || parts.len() > 5 {
+        return None;
+    }
+    if let Some(last) = parts.last() {
+        let tokens = tokenize(last)?;
+        let name = tokens.first()?.to_lowercase();
+        if matches!(name.as_str(), "format-table" | "ft" | "format-list" | "fl") {
+            parts.pop();
+        }
+    }
+    let left = tokenize(parts.first()?)?;
+    let left_name = left.first()?.to_lowercase();
+    if !matches!(left_name.as_str(), "get-childitem" | "gci" | "dir" | "ls") {
+        return None;
+    }
+    let parsed = parse_gci_options(&left[1..], cwd)?;
+    let mut where_filter = None;
+    let mut sort = None;
+    let mut projection = None;
+    let mut limit = None;
+    for part in parts.into_iter().skip(1) {
+        let tokens = tokenize(part)?;
+        let command_name = tokens.first()?.to_lowercase();
+        match command_name.as_str() {
+            "where-object" | "where" | "?" => {
+                if where_filter.is_some() {
+                    return None;
+                }
+                where_filter = Some(parse_where_object_filter(&tokens[1..])?);
+            }
+            "sort-object" | "sort" => {
+                if sort.is_some() {
+                    return None;
+                }
+                sort = Some(parse_sort_object(&tokens[1..])?);
+            }
+            "select-object" | "select" => {
+                if projection.is_some() {
+                    return None;
+                }
+                let parsed_select = parse_select_projection_with_limit(&tokens[1..])?;
+                projection = Some(parsed_select.0);
+                limit = parsed_select.1;
+            }
+            _ => return None,
+        }
+    }
+    if where_filter.is_none() && sort.is_none() {
+        return None;
+    }
+    Some(FastOperation::FindPipeline(FindPipeline {
+        query: FindQuery {
+            root: parsed.roots.into_iter().next(),
+            pattern: parsed
+                .filter
+                .or(parsed.include)
+                .unwrap_or_else(|| "*".to_string()),
+            files_only: true,
+            limit: 1_000,
+        },
+        where_filter,
+        sort,
+        projection: projection.unwrap_or(Projection::FullNameOnly),
+        limit,
+    }))
+}
+
+fn parse_find_measure(command: &str, cwd: Option<&str>) -> Option<FastOperation> {
+    let parts = split_pipeline(command)?;
+    if !(parts.len() == 2 || parts.len() == 3) {
+        return None;
+    }
+    let left = tokenize(parts[0])?;
+    let left_name = left.first()?.to_lowercase();
+    if !matches!(left_name.as_str(), "get-childitem" | "gci" | "dir" | "ls") {
+        return None;
+    }
+    let parsed = parse_gci_options(&left[1..], cwd)?;
+    let (where_filter, measure_part) = if parts.len() == 3 {
+        let where_tokens = tokenize(parts[1])?;
+        let where_name = where_tokens.first()?.to_lowercase();
+        if !matches!(where_name.as_str(), "where-object" | "where" | "?") {
+            return None;
+        }
+        (
+            Some(parse_where_object_filter(&where_tokens[1..])?),
+            parts[2],
+        )
+    } else {
+        (None, parts[1])
+    };
+    let measure_tokens = tokenize(measure_part)?;
+    let measure_name = measure_tokens.first()?.to_lowercase();
+    if !matches!(measure_name.as_str(), "measure-object" | "measure") {
+        return None;
+    }
+    Some(FastOperation::FindMeasure(FindMeasure {
+        query: FindQuery {
+            root: parsed.roots.into_iter().next(),
+            pattern: parsed
+                .filter
+                .or(parsed.include)
+                .unwrap_or_else(|| "*".to_string()),
+            files_only: true,
+            limit: 1_000,
+        },
+        where_filter,
+        measure: parse_measure_object(&measure_tokens[1..])?,
     }))
 }
 
@@ -662,7 +832,7 @@ fn parse_get_child_item_list(command: &str, cwd: Option<&str>) -> Option<FastOpe
     let pattern = parsed.filter.or(parsed.include)?;
     Some(FastOperation::FindProjection(FindProjection {
         query: FindQuery {
-            root: parsed.root,
+            root: parsed.roots.into_iter().next(),
             pattern,
             files_only: true,
             limit: 200,
@@ -673,7 +843,7 @@ fn parse_get_child_item_list(command: &str, cwd: Option<&str>) -> Option<FastOpe
 
 #[derive(Debug, Default)]
 struct GciOptions {
-    root: Option<String>,
+    roots: Vec<String>,
     filter: Option<String>,
     include: Option<String>,
     recurse: bool,
@@ -689,7 +859,11 @@ fn parse_gci_options(tokens: &[String], cwd: Option<&str>) -> Option<GciOptions>
             "-file" | "-force" | "/a-d" => {}
             "-path" | "-literalpath" => {
                 index += 1;
-                options.root = tokens.get(index).cloned();
+                if let Some(value) = tokens.get(index) {
+                    options.roots.extend(split_argument_list(value));
+                    index = consume_path_list_tail(tokens, index + 1, &mut options.roots);
+                    continue;
+                }
             }
             "-filter" => {
                 index += 1;
@@ -699,11 +873,14 @@ fn parse_gci_options(tokens: &[String], cwd: Option<&str>) -> Option<GciOptions>
                 index += 1;
                 options.include = tokens.get(index).cloned();
             }
+            "-erroraction" | "-ea" => index += 1,
             "-directory" | "/ad" => return None,
             value if value.starts_with("-path:") || value.starts_with("-literalpath:") => {
-                options.root = tokens[index]
-                    .split_once(':')
-                    .map(|(_, value)| value.to_string());
+                if let Some((_, value)) = tokens[index].split_once(':') {
+                    options.roots.extend(split_argument_list(value));
+                    index = consume_path_list_tail(tokens, index + 1, &mut options.roots);
+                    continue;
+                }
             }
             value if value.starts_with("-filter:") => {
                 options.filter = tokens[index]
@@ -716,21 +893,67 @@ fn parse_gci_options(tokens: &[String], cwd: Option<&str>) -> Option<GciOptions>
                     .map(|(_, value)| value.to_string());
             }
             value if value.starts_with('-') => return None,
-            _ => positional.push(tokens[index].clone()),
+            _ => positional.extend(split_argument_list(&tokens[index])),
         }
         index += 1;
     }
 
-    if options.root.is_none() && !positional.is_empty() {
-        options.root = Some(positional.remove(0));
+    if options.roots.is_empty() && !positional.is_empty() {
+        options.roots.push(positional.remove(0));
     }
-    if options.root.is_none() {
-        options.root = cwd.map(ToOwned::to_owned);
+    if options.roots.is_empty() {
+        options.roots.extend(cwd.map(ToOwned::to_owned));
     }
     if !positional.is_empty() {
         return None;
     }
     Some(options)
+}
+
+fn split_argument_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(clean_path_fragment)
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+fn consume_path_list_tail(tokens: &[String], mut index: usize, roots: &mut Vec<String>) -> usize {
+    let mut pending_separator = false;
+    while index < tokens.len() {
+        let token = tokens[index].trim();
+        if token.is_empty() {
+            index += 1;
+            continue;
+        }
+        if token == "," {
+            pending_separator = true;
+            index += 1;
+            continue;
+        }
+        if token.starts_with('-') && !pending_separator {
+            break;
+        }
+        if pending_separator || token.starts_with(',') {
+            roots.extend(split_argument_list(token));
+            pending_separator = false;
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    index
+}
+
+fn clean_path_fragment(value: &str) -> String {
+    let mut fragment = value.trim().trim_start_matches(',');
+    fragment = fragment.trim();
+    if (fragment.starts_with('"') && fragment.ends_with('"'))
+        || (fragment.starts_with('\'') && fragment.ends_with('\''))
+    {
+        fragment = &fragment[1..fragment.len() - 1];
+    }
+    fragment.to_string()
 }
 
 fn parse_select_string_pattern(tokens: &[String]) -> Option<String> {
@@ -776,7 +999,15 @@ fn parse_select_string_options(tokens: &[String]) -> Option<SelectStringOptions>
             }
             "-context" => {
                 index += 1;
-                let parsed = parse_context(tokens.get(index)?)?;
+                let value = tokens.get(index)?;
+                let parsed = if let Some(next) = tokens.get(index + 1)
+                    && next.starts_with(',')
+                {
+                    index += 1;
+                    parse_context(&format!("{value}{next}"))?
+                } else {
+                    parse_context(value)?
+                };
                 before = parsed.0;
                 after = parsed.1;
             }
@@ -838,7 +1069,131 @@ fn parse_select_projection(tokens: &[String]) -> Option<Projection> {
     }
 }
 
-fn parse_readonly_external(command: &str) -> Option<ReadOnlyExternal> {
+fn parse_select_projection_with_limit(tokens: &[String]) -> Option<(Projection, Option<usize>)> {
+    let mut projection_tokens = Vec::new();
+    let mut limit = None;
+    let mut index = 0;
+    while index < tokens.len() {
+        match tokens[index].to_lowercase().as_str() {
+            "-first" => {
+                index += 1;
+                limit = Some(tokens.get(index)?.parse().ok()?);
+            }
+            "-skip" | "-last" => return None,
+            value if value.starts_with('-') => projection_tokens.push(tokens[index].clone()),
+            _ => projection_tokens.push(tokens[index].clone()),
+        }
+        index += 1;
+    }
+    Some((parse_select_projection(&projection_tokens)?, limit))
+}
+
+fn parse_where_object_filter(tokens: &[String]) -> Option<FileWhere> {
+    let tokens = unwrap_braced_tokens(tokens);
+    let field = parse_file_field(tokens.first()?)?;
+    let operator = tokens.get(1)?.to_lowercase();
+    let value = tokens.get(2)?.clone();
+    if tokens.len() != 3 {
+        return None;
+    }
+    match operator.as_str() {
+        "-like" => Some(FileWhere::Like {
+            field,
+            pattern: value,
+        }),
+        "-eq" => Some(FileWhere::Equals { field, value }),
+        _ => None,
+    }
+}
+
+fn parse_sort_object(tokens: &[String]) -> Option<FileSort> {
+    let mut field = None;
+    let mut descending = false;
+    let mut index = 0;
+    while index < tokens.len() {
+        match tokens[index].to_lowercase().as_str() {
+            "-property" => {
+                index += 1;
+                field = Some(parse_file_field(tokens.get(index)?)?);
+            }
+            "-descending" => descending = true,
+            "-ascending" => {}
+            value if value.starts_with('-') => return None,
+            _ => {
+                if field.is_some() {
+                    return None;
+                }
+                field = Some(parse_file_field(&tokens[index])?);
+            }
+        }
+        index += 1;
+    }
+    Some(FileSort {
+        field: field?,
+        descending,
+    })
+}
+
+fn parse_measure_object(tokens: &[String]) -> Option<MeasureKind> {
+    if tokens.is_empty() {
+        return Some(MeasureKind::Count);
+    }
+    let mut property = None;
+    let mut index = 0;
+    while index < tokens.len() {
+        match tokens[index].to_lowercase().as_str() {
+            "-property" => {
+                index += 1;
+                property = Some(tokens.get(index)?.to_lowercase());
+            }
+            "-sum" | "-minimum" | "-maximum" | "-average" => {}
+            value if value.starts_with('-') => return None,
+            _ => {
+                if property.is_some() {
+                    return None;
+                }
+                property = Some(tokens[index].to_lowercase());
+            }
+        }
+        index += 1;
+    }
+    match property.as_deref() {
+        None => Some(MeasureKind::Count),
+        Some("length") => Some(MeasureKind::Length),
+        _ => None,
+    }
+}
+
+fn parse_file_field(value: &str) -> Option<FileField> {
+    let normalized = value
+        .trim_start_matches("$_.")
+        .trim_start_matches('.')
+        .to_lowercase();
+    match normalized.as_str() {
+        "fullname" | "full_name" => Some(FileField::FullName),
+        "name" => Some(FileField::Name),
+        "extension" => Some(FileField::Extension),
+        "length" => Some(FileField::Length),
+        "lastwritetime" | "last_write_time" => Some(FileField::LastWriteTime),
+        _ => None,
+    }
+}
+
+fn unwrap_braced_tokens(tokens: &[String]) -> Vec<String> {
+    let mut values = tokens.to_vec();
+    if let Some(first) = values.first_mut() {
+        *first = first.trim_start_matches('{').to_string();
+    }
+    if let Some(last) = values.last_mut() {
+        *last = last.trim_end_matches('}').to_string();
+    }
+    values
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+pub(super) fn parse_readonly_external(command: &str) -> Option<ReadOnlyExternal> {
     let tokens = tokenize(command)?;
     let program = tokens.first()?.to_lowercase();
     if program != "git" {
@@ -944,7 +1299,7 @@ fn split_pipeline(command: &str) -> Option<Vec<&str>> {
     }
 }
 
-fn split_command_list(command: &str) -> Option<Vec<&str>> {
+pub(super) fn split_command_list(command: &str) -> Option<Vec<&str>> {
     let mut parts = Vec::new();
     let mut start = 0;
     let mut quote = None;
@@ -967,7 +1322,7 @@ fn split_command_list(command: &str) -> Option<Vec<&str>> {
     }
 }
 
-fn tokenize(command: &str) -> Option<Vec<String>> {
+pub(super) fn tokenize(command: &str) -> Option<Vec<String>> {
     let pattern = Regex::new(r#""([^"]*)"|'([^']*)'|(\S+)"#).ok()?;
     let tokens: Vec<String> = pattern
         .captures_iter(command)
@@ -1190,6 +1545,13 @@ mod tests {
             ),
             ParseDecision::Fast(FastOperation::GrepContext(_))
         ));
+        assert!(matches!(
+            classify_powershell(
+                "Select-String -LiteralPath 'D:\\Github\\Project_Aetherflow\\论文\\答辩材料\\web-video\\presentation\\src\\styles\\base.css' -Pattern 'scene-pad|masthead|kicker|stage-frame|serif|label-mono|dot-accent|card|hero-num' -Context 0,2",
+                Some("C:\\repo")
+            ),
+            ParseDecision::Fast(FastOperation::GrepContext(_))
+        ));
     }
 
     #[test]
@@ -1207,6 +1569,75 @@ mod tests {
                 Some("C:\\repo")
             ),
             ParseDecision::Fast(FastOperation::FindProjection(_))
+        ));
+        assert!(matches!(
+            classify_powershell(
+                "Get-ChildItem -LiteralPath 'E:\\GitHub\\slowcatch' -Recurse -Filter AGENTS.md | Select-Object FullName,Length | Format-List",
+                Some("C:\\repo")
+            ),
+            ParseDecision::Fast(FastOperation::FindProjection(_))
+        ));
+    }
+
+    #[test]
+    fn parses_direct_literal_path_projection_forms() {
+        let decision = classify_powershell(
+            "Get-ChildItem -LiteralPath 'E:\\GitHub\\slowcatch\\target\\release\\slowcatch.exe','C:\\Users\\hxf53\\.codex\\bin\\slowcatch.exe' -ErrorAction SilentlyContinue | Select-Object FullName,Length,LastWriteTime | Format-List",
+            Some("C:\\repo"),
+        );
+
+        let ParseDecision::Fast(FastOperation::DirectProjection { paths, projection }) = decision
+        else {
+            panic!("unexpected decision: {decision:?}");
+        };
+        assert_eq!(paths.len(), 2);
+        assert!(matches!(projection, Projection::Metadata { .. }));
+    }
+
+    #[test]
+    fn parses_find_where_sort_select_pipeline() {
+        let decision = classify_powershell(
+            "Get-ChildItem C:\\repo -Recurse -Filter * | Where-Object Name -like *.rs | Sort-Object LastWriteTime -Descending | Select-Object -First 20 FullName,Length",
+            Some("C:\\repo"),
+        );
+
+        let ParseDecision::Fast(FastOperation::FindPipeline(pipeline)) = decision else {
+            panic!("unexpected decision: {decision:?}");
+        };
+        assert_eq!(pipeline.limit, Some(20));
+        assert!(pipeline.where_filter.is_some());
+        assert!(pipeline.sort.is_some());
+        assert!(matches!(pipeline.projection, Projection::Metadata { .. }));
+    }
+
+    #[test]
+    fn parses_find_where_select_pipeline_with_braced_member_access() {
+        let decision = classify_powershell(
+            "gci C:\\repo -Recurse | ? { $_.Extension -eq .toml } | select -First 5 -ExpandProperty FullName",
+            Some("C:\\repo"),
+        );
+
+        assert!(matches!(
+            decision,
+            ParseDecision::Fast(FastOperation::FindPipeline(_))
+        ));
+    }
+
+    #[test]
+    fn parses_find_measure_pipelines() {
+        assert!(matches!(
+            classify_powershell(
+                "Get-ChildItem C:\\repo -Recurse -Filter *.rs | Measure-Object",
+                Some("C:\\repo")
+            ),
+            ParseDecision::Fast(FastOperation::FindMeasure(_))
+        ));
+        assert!(matches!(
+            classify_powershell(
+                "gci C:\\repo -Recurse | ? Extension -eq .rs | measure Length -Sum -Minimum -Maximum",
+                Some("C:\\repo")
+            ),
+            ParseDecision::Fast(FastOperation::FindMeasure(_))
         ));
     }
 
@@ -1232,5 +1663,75 @@ mod tests {
             ),
             ParseDecision::UnknownCandidate(_)
         ));
+    }
+
+    #[test]
+    fn parses_guarded_test_path_get_content_as_mini_script() {
+        let command = r#"if (Test-Path "D:\Github\Project_Aetherflow\FLASHBACK.md") { Get-Content -Raw "D:\Github\Project_Aetherflow\FLASHBACK.md" }"#;
+
+        assert!(matches!(
+            classify_powershell(command, Some("D:\\Github\\Project_Aetherflow")),
+            ParseDecision::Fast(FastOperation::MiniScript(_))
+        ));
+    }
+
+    #[test]
+    fn parses_literal_variable_guard_as_mini_script() {
+        let command = r#"$p = "D:\Github\Project_Aetherflow\FLASHBACK.md"; if (Test-Path $p) { Get-Content -Raw $p }"#;
+
+        assert!(matches!(
+            classify_powershell(command, Some("D:\\Github\\Project_Aetherflow")),
+            ParseDecision::Fast(FastOperation::MiniScript(_))
+        ));
+    }
+
+    #[test]
+    fn parses_elseif_else_and_boolean_test_path_tree_as_mini_script() {
+        let command = r#"$a = "C:\repo\a.md"; $b = "C:\repo\b.md"; if ((Test-Path $a -PathType Leaf) -and -not (Test-Path $b)) { Get-Content $a } elseif (!(Test-Path $a) -or (Test-Path $b)) { Get-Content $b } else { git status --short }"#;
+
+        assert!(matches!(
+            classify_powershell(command, Some("C:\\repo")),
+            ParseDecision::Fast(FastOperation::MiniScript(_))
+        ));
+    }
+
+    #[test]
+    fn mini_script_reuses_existing_fast_path_body_parsers() {
+        let command = r#"if (Test-Path "C:\repo") { Get-ChildItem C:\repo -Recurse -Filter *.rs | Select-Object -ExpandProperty FullName; Select-String -Path C:\repo\*.rs -Pattern needle }"#;
+
+        assert!(matches!(
+            classify_powershell(command, Some("C:\\repo")),
+            ParseDecision::Fast(FastOperation::MiniScript(_))
+        ));
+    }
+
+    #[test]
+    fn mini_script_allows_readonly_git_diff_body() {
+        let command = r#"if (Test-Path "C:\repo") { git diff --stat }"#;
+
+        assert!(matches!(
+            classify_powershell(command, Some("C:\\repo")),
+            ParseDecision::Fast(FastOperation::MiniScript(_))
+        ));
+    }
+
+    #[test]
+    fn mini_script_rejects_unsafe_or_ambiguous_shapes() {
+        for command in [
+            r#"if (Test-Path "C:\repo\*.md") { Get-Content "C:\repo\a.md" }"#,
+            r#"if (Test-Path $p) { Get-Content $p }"#,
+            r#"$p = "C:\repo\a.md"; if (Test-Path $p) { Remove-Item $p }"#,
+            r#"$p = "$env:USERPROFILE\a.md"; if (Test-Path $p) { Get-Content $p }"#,
+            r#"if (Test-Path "C:\repo\a.md") { if (Test-Path "C:\repo\b.md") { Get-Content "C:\repo\b.md" } }"#,
+            r#"if (Test-Path $(Get-Location)) { Get-Content file.txt }"#,
+        ] {
+            assert!(
+                !matches!(
+                    classify_powershell(command, Some("C:\\repo")),
+                    ParseDecision::Fast(FastOperation::MiniScript(_))
+                ),
+                "{command}"
+            );
+        }
     }
 }

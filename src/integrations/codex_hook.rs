@@ -4,7 +4,8 @@ use crate::backends::inspect_file;
 use crate::backends::projection;
 use crate::backends::slice;
 use crate::shell_parse::{
-    FastOperation, FastSegment, ParseDecision, UnknownCommand, classify_powershell,
+    FastOperation, FastSegment, MiniCondition, ParseDecision, TestPathType, UnknownCommand,
+    classify_powershell,
 };
 use crate::unknown_log::HookLogContext;
 use anyhow::Result;
@@ -138,10 +139,22 @@ fn execute_operation(
     cwd: Option<&str>,
 ) -> Result<String> {
     match operation {
-        FastOperation::Find(query) => Ok(finder.find(query)?.join("\n")),
+        FastOperation::Find(query) => Ok(render_lines_or_no_results(finder.find(query)?)),
         FastOperation::FindProjection(projection) => {
             let paths = finder.find(&projection.query)?;
             projection::render_projection(&paths, &projection.projection)
+        }
+        FastOperation::FindPipeline(pipeline) => {
+            let paths = finder.find(&pipeline.query)?;
+            let paths = projection::apply_find_pipeline(paths, pipeline);
+            projection::render_projection(&paths, &pipeline.projection)
+        }
+        FastOperation::FindMeasure(measure) => {
+            let paths = finder.find(&measure.query)?;
+            Ok(projection::render_find_measure(paths, measure))
+        }
+        FastOperation::DirectProjection { paths, projection } => {
+            projection::render_projection(paths, projection)
         }
         FastOperation::Grep(query) => Ok(grep::grep(&query)?
             .into_iter()
@@ -167,6 +180,72 @@ fn execute_operation(
                 }
             }
             Ok(output.join("\n"))
+        }
+        FastOperation::MiniScript(script) => {
+            let mut selected = None;
+            for branch in &script.branches {
+                if branch
+                    .condition
+                    .as_ref()
+                    .map(evaluate_condition)
+                    .transpose()?
+                    .unwrap_or(true)
+                {
+                    selected = Some(&branch.segments);
+                    break;
+                }
+            }
+            let Some(segments) = selected else {
+                return Ok("mini_script: no output".to_string());
+            };
+            let mut output = Vec::new();
+            for segment in segments {
+                match segment {
+                    FastSegment::Operation(operation) => {
+                        output.push(execute_operation(operation, finder, cwd)?);
+                    }
+                    FastSegment::ReadOnlyExternal(external) => {
+                        output.push(projection::run_read_only_external(external, cwd)?);
+                    }
+                }
+            }
+            if output.is_empty() {
+                Ok("mini_script: no output".to_string())
+            } else {
+                Ok(output.join("\n"))
+            }
+        }
+    }
+}
+
+fn render_lines_or_no_results(lines: Vec<String>) -> String {
+    if lines.is_empty() {
+        "no results".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn evaluate_condition(condition: &MiniCondition) -> Result<bool> {
+    match condition {
+        MiniCondition::TestPath { path, path_type } => {
+            let metadata = match std::fs::metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error.into()),
+            };
+            Ok(match path_type {
+                TestPathType::Any => true,
+                TestPathType::Leaf => metadata.is_file(),
+                TestPathType::Container => metadata.is_dir(),
+            })
+        }
+        MiniCondition::Not(inner) => Ok(!evaluate_condition(inner)?),
+        MiniCondition::And(left, right) => {
+            Ok(evaluate_condition(left)? && evaluate_condition(right)?)
+        }
+        MiniCondition::Or(left, right) => {
+            Ok(evaluate_condition(left)? || evaluate_condition(right)?)
         }
     }
 }
@@ -212,11 +291,15 @@ fn operation_kind(operation: &FastOperation) -> &'static str {
     match operation {
         FastOperation::Find(_) => "find",
         FastOperation::FindProjection(_) => "find_projection",
+        FastOperation::FindPipeline(_) => "find_pipeline",
+        FastOperation::FindMeasure(_) => "find_measure",
+        FastOperation::DirectProjection { .. } => "direct_projection",
         FastOperation::Grep(_) => "grep",
         FastOperation::GrepContext(_) => "grep_context",
         FastOperation::InspectFile { .. } => "inspect_file",
         FastOperation::Slice { .. } => "slice",
         FastOperation::CommandList(_) => "command_list",
+        FastOperation::MiniScript(_) => "mini_script",
     }
 }
 
@@ -421,5 +504,183 @@ mod tests {
 
         assert!(output.contains("FAST_PATH_SUCCESS"));
         assert!(output.contains("C:\\\\repo\\\\main.rs"));
+    }
+
+    #[test]
+    fn hook_find_pipeline_filters_sorts_limits_and_projects() {
+        struct PipelineFinder {
+            paths: Vec<String>,
+        }
+
+        impl FileFinder for PipelineFinder {
+            fn find(&self, _query: &FindQuery) -> Result<Vec<String>> {
+                Ok(self.paths.clone())
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let old = temp.path().join("old.rs");
+        let new = temp.path().join("new.rs");
+        let note = temp.path().join("note.txt");
+        std::fs::write(&old, "old").unwrap();
+        std::fs::write(&new, "new file with more bytes").unwrap();
+        std::fs::write(&note, "note").unwrap();
+        let command = format!(
+            "Get-ChildItem '{}' -Recurse -Filter * | Where-Object Name -like *.rs | Sort-Object Length -Descending | Select-Object -First 1 FullName",
+            temp.path().display()
+        );
+        let input = json!({
+            "cwd": temp.path().display().to_string(),
+            "tool_input": { "command": command }
+        })
+        .to_string();
+
+        let output = handle_hook_json(
+            &input,
+            &PipelineFinder {
+                paths: vec![
+                    old.display().to_string(),
+                    note.display().to_string(),
+                    new.display().to_string(),
+                ],
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(output.contains("FAST_PATH_SUCCESS"));
+        assert!(output.contains(&new.display().to_string().replace('\\', "\\\\")));
+        assert!(!output.contains(&old.display().to_string().replace('\\', "\\\\")));
+    }
+
+    #[test]
+    fn hook_find_measure_counts_filtered_paths() {
+        struct MeasureFinder {
+            paths: Vec<String>,
+        }
+
+        impl FileFinder for MeasureFinder {
+            fn find(&self, _query: &FindQuery) -> Result<Vec<String>> {
+                Ok(self.paths.clone())
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let rs = temp.path().join("main.rs");
+        let txt = temp.path().join("note.txt");
+        std::fs::write(&rs, "rust").unwrap();
+        std::fs::write(&txt, "text").unwrap();
+        let command = format!(
+            "Get-ChildItem '{}' -Recurse | Where-Object Extension -eq .rs | Measure-Object",
+            temp.path().display()
+        );
+        let input = json!({
+            "cwd": temp.path().display().to_string(),
+            "tool_input": { "command": command }
+        })
+        .to_string();
+
+        let output = handle_hook_json(
+            &input,
+            &MeasureFinder {
+                paths: vec![rs.display().to_string(), txt.display().to_string()],
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(output.contains("FAST_PATH_SUCCESS"));
+        assert!(output.contains("Count=1"));
+    }
+
+    #[test]
+    fn hook_mini_script_true_branch_blocks_with_fast_path_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("FLASHBACK.md");
+        std::fs::write(&file, "# title\nline\n").unwrap();
+        let command = format!(
+            r#"if (Test-Path "{}") {{ Get-Content -Raw "{}" }}"#,
+            file.display(),
+            file.display()
+        );
+        let input = json!({
+            "cwd": temp.path().display().to_string(),
+            "tool_input": { "command": command }
+        })
+        .to_string();
+
+        let output = handle_hook_json(&input, &MockFinder).unwrap().unwrap();
+
+        assert!(output.contains("FAST_PATH_SUCCESS"));
+        assert!(output.contains("L1 | # title"));
+    }
+
+    #[test]
+    fn hook_mini_script_false_branch_blocks_with_no_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing.md");
+        let command = format!(
+            r#"if (Test-Path "{}") {{ Get-Content -Raw "{}" }}"#,
+            missing.display(),
+            missing.display()
+        );
+        let input = json!({
+            "cwd": temp.path().display().to_string(),
+            "tool_input": { "command": command }
+        })
+        .to_string();
+
+        let output = handle_hook_json(&input, &MockFinder).unwrap().unwrap();
+
+        assert!(output.contains("FAST_PATH_SUCCESS"));
+        assert!(output.contains("no output"));
+    }
+
+    #[test]
+    fn hook_mini_script_false_branch_runs_else_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing.md");
+        let fallback = temp.path().join("fallback.md");
+        std::fs::write(&fallback, "fallback\n").unwrap();
+        let command = format!(
+            r#"if (Test-Path "{}") {{ Get-Content -Raw "{}" }} else {{ Get-Content -Raw "{}" }}"#,
+            missing.display(),
+            missing.display(),
+            fallback.display()
+        );
+        let input = json!({
+            "cwd": temp.path().display().to_string(),
+            "tool_input": { "command": command }
+        })
+        .to_string();
+
+        let output = handle_hook_json(&input, &MockFinder).unwrap().unwrap();
+
+        assert!(output.contains("FAST_PATH_SUCCESS"));
+        assert!(output.contains("L1 | fallback"));
+    }
+
+    #[test]
+    fn hook_mini_script_backend_failure_logs_and_fails_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("dir.md");
+        std::fs::create_dir(&directory).unwrap();
+        let log_path = temp.path().join("unknown.jsonl");
+        let command = format!(
+            r#"if (Test-Path "{}") {{ Get-Content -Raw "{}" }}"#,
+            directory.display(),
+            directory.display()
+        );
+        let input = json!({
+            "cwd": temp.path().display().to_string(),
+            "tool_input": { "command": command }
+        })
+        .to_string();
+
+        let output = handle_hook_json_with_log_path(&input, &MockFinder, &log_path).unwrap();
+
+        assert!(output.is_none());
+        let log = std::fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("fast_path_backend_failure:mini_script"));
     }
 }
