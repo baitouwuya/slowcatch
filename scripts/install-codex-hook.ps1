@@ -67,6 +67,45 @@ function ConvertTo-Hashtable {
     }
 }
 
+function Read-Utf8TextNoBom {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $null
+    }
+
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -eq 0) {
+        return ""
+    }
+
+    $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+    return $text.TrimStart([char]0xFEFF)
+}
+
+function Write-Utf8NoBom {
+    param(
+        [string]$Path,
+        [string]$Text
+    )
+
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Text, $encoding)
+}
+
+function Backup-InvalidHooksJson {
+    param([string]$HooksPath)
+
+    if (-not (Test-Path -LiteralPath $HooksPath)) {
+        return $null
+    }
+
+    $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $backupPath = "$HooksPath.bak.$timestamp"
+    Copy-Item -LiteralPath $HooksPath -Destination $backupPath -Force
+    return $backupPath
+}
+
 function Test-SlowcatchHookCommand {
     param($Hook)
 
@@ -96,11 +135,17 @@ function Merge-CodexHook {
     )
 
     if (Test-Path -LiteralPath $HooksPath) {
-        $raw = Get-Content -LiteralPath $HooksPath -Raw
+        $raw = Read-Utf8TextNoBom $HooksPath
         if ([string]::IsNullOrWhiteSpace($raw)) {
             $document = [ordered]@{}
         } else {
-            $document = ConvertTo-Hashtable ($raw | ConvertFrom-Json)
+            try {
+                $document = ConvertTo-Hashtable ($raw | ConvertFrom-Json)
+            } catch {
+                $backupPath = Backup-InvalidHooksJson $HooksPath
+                Write-Warning "Existing hooks.json is not valid JSON. Backed it up to $backupPath and created a fresh hooks.json."
+                $document = [ordered]@{}
+            }
         }
     } else {
         $document = [ordered]@{}
@@ -168,8 +213,8 @@ function Merge-CodexHook {
         New-Item -ItemType Directory -Path $parent -Force | Out-Null
     }
 
-    $json = $document | ConvertTo-Json -Depth 32
-    Set-Content -LiteralPath $HooksPath -Value $json -Encoding UTF8
+    $json = ($document | ConvertTo-Json -Depth 32) + [Environment]::NewLine
+    Write-Utf8NoBom -Path $HooksPath -Text $json
 }
 
 function Test-CodexHooksFeatureEnabled {
@@ -179,7 +224,7 @@ function Test-CodexHooksFeatureEnabled {
         return $false
     }
 
-    $content = Get-Content -LiteralPath $ConfigPath -Raw
+    $content = Read-Utf8TextNoBom $ConfigPath
     return $content -match '(?m)^\s*codex_hooks\s*=\s*true\s*(#.*)?$'
 }
 

@@ -52,6 +52,18 @@ codex_hooks = true
 Restart Codex or reload hooks after installing if your current session does not
 pick up hook changes automatically.
 
+### Repair Hooks JSON
+
+If Codex reports:
+
+```text
+failed to parse hooks config ... hooks.json: expected value at line 1 column 1
+```
+
+run the install command again from PowerShell. The installer rewrites
+`hooks.json` as UTF-8 without BOM. If the existing file is invalid JSON, it is
+backed up as `hooks.json.bak.<timestamp>` and a fresh hook config is created.
+
 ## What It Does
 
 `slowcatch` targets common slow, read-only shell patterns:

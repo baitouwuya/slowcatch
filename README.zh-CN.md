@@ -51,6 +51,18 @@ codex_hooks = true
 如果当前 Codex 会话不会自动重载 hook 配置，安装或更新后需要重启 Codex 或
 手动重载 hooks。
 
+### 修复 Hooks JSON
+
+如果 Codex 报错：
+
+```text
+failed to parse hooks config ... hooks.json: expected value at line 1 column 1
+```
+
+直接在 PowerShell 里重新运行安装命令。安装脚本会用无 BOM UTF-8 重写
+`hooks.json`。如果现有文件不是合法 JSON，会先备份为
+`hooks.json.bak.<timestamp>`，再创建新的 hook 配置。
+
 ## 功能概览
 
 `slowcatch` 主要加速常见的只读慢路径：
