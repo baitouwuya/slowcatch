@@ -2,7 +2,8 @@ param(
     [string]$Version,
     [string]$InstallDir = (Join-Path $env:USERPROFILE ".codex\bin"),
     [string]$CodexHome = (Join-Path $env:USERPROFILE ".codex"),
-    [switch]$Force
+    [switch]$Force,
+    [string]$AssetPath
 )
 
 Set-StrictMode -Version 2.0
@@ -228,6 +229,37 @@ function Test-CodexHooksFeatureEnabled {
     return $content -match '(?m)^\s*codex_hooks\s*=\s*true\s*(#.*)?$'
 }
 
+function Install-SlowcatchBinary {
+    param(
+        [string]$SourcePath,
+        [string]$TargetExe,
+        [string]$ReleaseVersion
+    )
+
+    $safeVersion = $ReleaseVersion -replace '[^A-Za-z0-9._-]', '-'
+    $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $candidates = @(
+        $TargetExe,
+        (Join-Path (Split-Path -Parent $TargetExe) "slowcatch-$safeVersion.exe"),
+        (Join-Path (Split-Path -Parent $TargetExe) "slowcatch-$safeVersion-$timestamp.exe")
+    )
+
+    $lastError = $null
+    foreach ($candidate in $candidates) {
+        try {
+            [System.IO.File]::Copy($SourcePath, $candidate, $true)
+            if ($candidate -ne $TargetExe) {
+                Write-Warning "Could not overwrite $TargetExe. Installing versioned binary instead: $candidate"
+            }
+            return $candidate
+        } catch {
+            $lastError = $_
+        }
+    }
+
+    throw $lastError
+}
+
 $releaseVersion = Resolve-ReleaseVersion
 $downloadUrl = "https://github.com/$Repo/releases/download/$releaseVersion/$AssetName"
 $targetDir = [System.IO.Path]::GetFullPath($InstallDir)
@@ -245,23 +277,33 @@ if (-not (Test-Path -LiteralPath $targetDir)) {
 }
 
 $tempFile = Join-Path ([System.IO.Path]::GetTempPath()) ("slowcatch-" + [System.Guid]::NewGuid().ToString("N") + ".exe")
+$sourcePath = $null
 try {
-    Invoke-WebRequest -Uri $downloadUrl -OutFile $tempFile -UseBasicParsing -Headers @{ "User-Agent" = $UserAgent }
+    if (-not [string]::IsNullOrWhiteSpace($AssetPath)) {
+        $sourcePath = [System.IO.Path]::GetFullPath($AssetPath)
+        if (-not (Test-Path -LiteralPath $sourcePath)) {
+            throw "AssetPath does not exist: $sourcePath"
+        }
+    } else {
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $tempFile -UseBasicParsing -Headers @{ "User-Agent" = $UserAgent }
+        $sourcePath = $tempFile
+    }
 
     if ((Test-Path -LiteralPath $targetExe) -and $Force) {
         Remove-Item -LiteralPath $targetExe -Force
     }
 
-    Move-Item -LiteralPath $tempFile -Destination $targetExe -Force
+    $installedExe = Install-SlowcatchBinary -SourcePath $sourcePath -TargetExe $targetExe -ReleaseVersion $releaseVersion
 } finally {
     if (Test-Path -LiteralPath $tempFile) {
         Remove-Item -LiteralPath $tempFile -Force
     }
 }
 
-Merge-CodexHook -HooksPath $hooksPath -ExePath $targetExe
+Merge-CodexHook -HooksPath $hooksPath -ExePath $installedExe
 
 Write-Host "Updated Codex hooks: $hooksPath"
+Write-Host "Hook command uses: $installedExe"
 
 if (-not (Test-CodexHooksFeatureEnabled $configPath)) {
     Write-Warning "Codex hooks may not be enabled. Add this to ${configPath}:"

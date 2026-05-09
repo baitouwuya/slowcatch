@@ -51,6 +51,9 @@ codex_hooks = true
 如果当前 Codex 会话不会自动重载 hook 配置，安装或更新后需要重启 Codex 或
 手动重载 hooks。
 
+如果目标 exe 被占用，安装脚本会继续执行，把版本化的
+`slowcatch-<version>.exe` 放到旁边，并把 hook 指向这个路径。
+
 Codex 会按会话加载 hook 配置。如果已有 Codex 窗口正在运行，更新后需要重启
 Codex 或重载 hooks，避免当前会话继续使用旧的 hook 命令。
 
@@ -148,7 +151,7 @@ slowcatch slice README.md --skip 0 --first 30 --output jsonl
           {
             "type": "command",
             "command": "C:\\Users\\you\\.codex\\bin\\slowcatch.exe hook codex",
-            "timeout": 10,
+            "timeout": 15,
             "statusMessage": "Checking slowcatch fast-path"
           }
         ]

@@ -52,6 +52,10 @@ codex_hooks = true
 Restart Codex or reload hooks after installing if your current session does not
 pick up hook changes automatically.
 
+If the target executable is locked, the installer keeps going by placing a
+versioned `slowcatch-<version>.exe` next to it and updating the hook to point at
+that path.
+
 Codex reads hook configuration at session scope. If you have an existing Codex
 window open, restart Codex or reload hooks after updating so the session stops
 using any previously loaded hook command.
@@ -151,7 +155,7 @@ Install mode configures:
           {
             "type": "command",
             "command": "C:\\Users\\you\\.codex\\bin\\slowcatch.exe hook codex",
-            "timeout": 10,
+            "timeout": 15,
             "statusMessage": "Checking slowcatch fast-path"
           }
         ]
