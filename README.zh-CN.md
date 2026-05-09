@@ -23,7 +23,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr https://raw.githubus
 固定安装某个版本：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((iwr https://raw.githubusercontent.com/baitouwuya/slowcatch/master/scripts/install-codex-hook.ps1 -UseB).Content)) -Version v0.1.0"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((iwr https://raw.githubusercontent.com/baitouwuya/slowcatch/master/scripts/install-codex-hook.ps1 -UseB).Content)) -Version v0.1.1"
 ```
 
 安装脚本会从 latest release 下载
@@ -50,6 +50,9 @@ codex_hooks = true
 
 如果当前 Codex 会话不会自动重载 hook 配置，安装或更新后需要重启 Codex 或
 手动重载 hooks。
+
+Codex 会按会话加载 hook 配置。如果已有 Codex 窗口正在运行，更新后需要重启
+Codex 或重载 hooks，避免当前会话继续使用旧的 hook 命令。
 
 ### 修复 Hooks JSON
 
@@ -179,6 +182,9 @@ FAST_PATH_SUCCESS
 
 不确定或后端失败时，hook 不输出 stdout 并以 `0` 退出，Codex 会继续执行原始
 shell 命令。
+
+Hook fast-path 还有内部运行预算。慢后端会在 `slowcatch` 内部超时，记录为后端
+失败并 fail-open，避免拖到 Codex 自己的 hook timeout。
 
 ## 文件检查策略
 

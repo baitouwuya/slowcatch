@@ -1,4 +1,4 @@
-use crate::backends::everything::{EverythingFinder, FileFinder};
+use crate::backends::everything::{FileFinder, TimedEverythingFinder};
 use crate::backends::grep;
 use crate::backends::inspect_file;
 use crate::backends::projection;
@@ -11,8 +11,12 @@ use anyhow::Result;
 use serde::Deserialize;
 use serde_json::json;
 use std::io::Read;
+use std::sync::Arc;
+use std::time::Duration;
 
 const FAST_PATH_PREFIX: &str = "FAST_PATH_SUCCESS";
+const HOOK_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+const EVERYTHING_HOOK_TIMEOUT: Duration = Duration::from_millis(1_500);
 
 #[derive(Debug, Deserialize)]
 struct HookInput {
@@ -31,7 +35,13 @@ struct ToolInput {
 pub fn run_from_stdin() -> Result<()> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
-    if let Some(output) = handle_hook_json(&input, &EverythingFinder)? {
+    let finder = Arc::new(TimedEverythingFinder::new(EVERYTHING_HOOK_TIMEOUT));
+    if let Some(output) = handle_hook_json_with_log_path_and_timeout(
+        &input,
+        finder,
+        &crate::unknown_log::default_log_path(),
+        HOOK_OPERATION_TIMEOUT,
+    )? {
         println!("{output}");
     }
     Ok(())
@@ -46,6 +56,30 @@ pub fn handle_hook_json_with_log_path(
     finder: &dyn FileFinder,
     unknown_log_path: &std::path::Path,
 ) -> Result<Option<String>> {
+    handle_hook_json_inner(input, unknown_log_path, |operation, cwd| {
+        execute_operation(operation, finder, cwd)
+    })
+}
+
+pub fn handle_hook_json_with_log_path_and_timeout(
+    input: &str,
+    finder: Arc<dyn FileFinder>,
+    unknown_log_path: &std::path::Path,
+    timeout: Duration,
+) -> Result<Option<String>> {
+    handle_hook_json_inner(input, unknown_log_path, |operation, cwd| {
+        execute_operation_with_timeout(operation, Arc::clone(&finder), cwd, timeout)
+    })
+}
+
+fn handle_hook_json_inner<F>(
+    input: &str,
+    unknown_log_path: &std::path::Path,
+    execute: F,
+) -> Result<Option<String>>
+where
+    F: Fn(&FastOperation, Option<&str>) -> Result<String>,
+{
     let _ = unknown_log_path;
     let hook_input: HookInput = serde_json::from_str(input)?;
     let context = log_context(&hook_input);
@@ -59,7 +93,7 @@ pub fn handle_hook_json_with_log_path(
 
     match classify_powershell(&command, hook_input.cwd.as_deref()) {
         ParseDecision::Fast(operation) => {
-            let output = match execute_operation(&operation, finder, hook_input.cwd.as_deref()) {
+            let output = match execute(&operation, hook_input.cwd.as_deref()) {
                 Ok(output) => output,
                 Err(error) => {
                     log_fast_path_failure(unknown_log_path, &command, &operation, &context, &error);
@@ -135,6 +169,24 @@ fn execute_operation(
             Ok(output.join("\n"))
         }
     }
+}
+
+fn execute_operation_with_timeout(
+    operation: &FastOperation,
+    finder: Arc<dyn FileFinder>,
+    cwd: Option<&str>,
+    timeout: Duration,
+) -> Result<String> {
+    let operation = operation.clone();
+    let cwd = cwd.map(ToOwned::to_owned);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = execute_operation(&operation, finder.as_ref(), cwd.as_deref());
+        let _ = sender.send(result);
+    });
+    receiver
+        .recv_timeout(timeout)
+        .map_err(|_| anyhow::anyhow!("hook operation timed out after {}ms", timeout.as_millis()))?
 }
 
 fn log_fast_path_failure(
@@ -272,6 +324,36 @@ mod tests {
         fn find(&self, _query: &FindQuery) -> Result<Vec<String>> {
             anyhow::bail!("backend unavailable")
         }
+    }
+
+    struct SlowFinder;
+
+    impl FileFinder for SlowFinder {
+        fn find(&self, _query: &FindQuery) -> Result<Vec<String>> {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            Ok(vec!["late".to_string()])
+        }
+    }
+
+    #[test]
+    fn hook_operation_timeout_logs_and_fails_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let log_path = temp.path().join("unknown.jsonl");
+        let input = r#"{"cwd":"C:\\repo","tool_input":{"command":"Get-ChildItem C:\\repo -Recurse -Filter *.rs"}}"#;
+        let start = std::time::Instant::now();
+
+        let output = handle_hook_json_with_log_path_and_timeout(
+            input,
+            Arc::new(SlowFinder),
+            &log_path,
+            std::time::Duration::from_millis(50),
+        )
+        .unwrap();
+
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert!(output.is_none());
+        let log = std::fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("hook operation timed out"));
     }
 
     #[test]

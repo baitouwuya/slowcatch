@@ -1,6 +1,7 @@
 use anyhow::Result;
+use std::time::Duration;
 
-pub trait FileFinder {
+pub trait FileFinder: Send + Sync {
     fn find(&self, query: &FindQuery) -> Result<Vec<String>>;
 }
 
@@ -19,6 +20,34 @@ impl FileFinder for EverythingFinder {
     fn find(&self, query: &FindQuery) -> Result<Vec<String>> {
         find_with_everything(query)
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TimedEverythingFinder {
+    timeout: Duration,
+}
+
+impl TimedEverythingFinder {
+    pub fn new(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+}
+
+impl FileFinder for TimedEverythingFinder {
+    fn find(&self, query: &FindQuery) -> Result<Vec<String>> {
+        find_with_everything_timeout(query, self.timeout)
+    }
+}
+
+pub fn find_with_everything_timeout(query: &FindQuery, timeout: Duration) -> Result<Vec<String>> {
+    let query = query.clone();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = sender.send(find_with_everything(&query));
+    });
+    receiver.recv_timeout(timeout).map_err(|_| {
+        anyhow::anyhow!("Everything query timed out after {}ms", timeout.as_millis())
+    })?
 }
 
 #[cfg(windows)]

@@ -23,7 +23,7 @@ Run the same command again to update.
 To pin a version:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((iwr https://raw.githubusercontent.com/baitouwuya/slowcatch/master/scripts/install-codex-hook.ps1 -UseB).Content)) -Version v0.1.0"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((iwr https://raw.githubusercontent.com/baitouwuya/slowcatch/master/scripts/install-codex-hook.ps1 -UseB).Content)) -Version v0.1.1"
 ```
 
 The installer downloads `slowcatch-x86_64-pc-windows-msvc.exe` from the latest
@@ -51,6 +51,10 @@ codex_hooks = true
 
 Restart Codex or reload hooks after installing if your current session does not
 pick up hook changes automatically.
+
+Codex reads hook configuration at session scope. If you have an existing Codex
+window open, restart Codex or reload hooks after updating so the session stops
+using any previously loaded hook command.
 
 ### Repair Hooks JSON
 
@@ -182,6 +186,10 @@ original command.
 
 On uncertainty or backend failure, the hook writes no stdout and exits `0`, so
 Codex runs the original shell command unchanged.
+
+Hook fast paths also have an internal operation budget. Slow backends time out
+inside `slowcatch`, are logged as backend failures, and fail open before Codex's
+own hook timeout should fire.
 
 ## File Inspection
 

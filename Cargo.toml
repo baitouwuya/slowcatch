@@ -1,6 +1,6 @@
 [package]
 name = "slowcatch"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "High-performance local developer tool that catches slow shell paths with safe fast-path hooks for Codex and other agents."

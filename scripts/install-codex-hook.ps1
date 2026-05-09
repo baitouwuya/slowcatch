@@ -200,7 +200,7 @@ function Merge-CodexHook {
             [ordered]@{
                 type = "command"
                 command = New-HookCommand $ExePath
-                timeout = 10
+                timeout = 15
                 statusMessage = "Checking slowcatch fast-path"
             }
         )

@@ -1,4 +1,4 @@
-use crate::backends::everything::{EverythingFinder, FileFinder, FindQuery};
+use crate::backends::everything::{EverythingFinder, FileFinder, FindQuery, TimedEverythingFinder};
 use crate::backends::grep::{self, GrepQuery};
 use crate::backends::slice;
 use crate::integrations::codex_hook;
@@ -9,6 +9,7 @@ use crate::structured::{
 use anyhow::Result;
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use std::path::PathBuf;
+use std::time::Duration;
 
 const STRUCTURED_SCAN_LIMIT: usize = 5_000;
 
@@ -176,7 +177,7 @@ pub fn run() -> Result<()> {
                 std::env::current_dir()?.to_str(),
             )
             .ok_or_else(|| anyhow::anyhow!("PowerShell parser self-test failed"))?;
-            let finder = EverythingFinder;
+            let finder = TimedEverythingFinder::new(Duration::from_secs(3));
             let _ = finder.find(&FindQuery {
                 root: std::env::current_dir()?.to_str().map(ToOwned::to_owned),
                 pattern: "Cargo.toml".to_string(),
