@@ -118,6 +118,81 @@ function Test-SlowcatchHookCommand {
     return $command -match '(?i)(slowcatch|rust-fast-tool)(?:\.exe)?["'']?\s+hook\s+codex'
 }
 
+function ConvertTo-ArrayValue {
+    param($Value)
+
+    if ($null -eq $Value) {
+        return @()
+    }
+
+    if ($Value -is [System.Array]) {
+        return @($Value)
+    }
+
+    return @($Value)
+}
+
+function Normalize-HookGroups {
+    param($Groups)
+
+    $normalized = @()
+    foreach ($group in (ConvertTo-ArrayValue $Groups)) {
+        if ($null -eq $group) {
+            continue
+        }
+
+        if (-not ($group -is [System.Collections.IDictionary])) {
+            $normalized += ,$group
+            continue
+        }
+
+        if ($group.Contains("hooks")) {
+            $group["hooks"] = @(ConvertTo-ArrayValue $group["hooks"])
+        } else {
+            $group["hooks"] = @()
+        }
+
+        $normalized += ,$group
+    }
+
+    return $normalized
+}
+
+function Assert-CodexHooksSchema {
+    param($Document)
+
+    if ($null -eq $Document -or -not ($Document -is [System.Collections.IDictionary])) {
+        throw "Invalid hooks config: document must be an object."
+    }
+
+    if (-not $Document.Contains("hooks")) {
+        return
+    }
+
+    $hooks = $Document["hooks"]
+    if ($null -eq $hooks) {
+        return
+    }
+
+    if (-not ($hooks -is [System.Collections.IDictionary])) {
+        throw "Invalid hooks config: hooks must be an object."
+    }
+
+    foreach ($event in $hooks.Keys) {
+        if (-not ($hooks[$event] -is [System.Array])) {
+            throw "Invalid hooks config: hooks.$event must be an array."
+        }
+
+        foreach ($group in $hooks[$event]) {
+            if ($group -is [System.Collections.IDictionary] -and
+                $group.Contains("hooks") -and
+                -not ($group["hooks"] -is [System.Array])) {
+                throw "Invalid hooks config: hooks.$event[].hooks must be an array."
+            }
+        }
+    }
+}
+
 function New-HookCommand {
     param([string]$ExePath)
 
@@ -133,16 +208,14 @@ function Remove-SlowcatchHooksFromGroups {
     param($Groups)
 
     $mergedGroups = @()
-    foreach ($group in @($Groups)) {
+    foreach ($group in (Normalize-HookGroups $Groups)) {
         if ($null -eq $group -or -not ($group -is [System.Collections.IDictionary])) {
             $mergedGroups += ,$group
             continue
         }
 
-        $originalHooks = @()
-        if ($group.Contains("hooks") -and $null -ne $group["hooks"]) {
-            $originalHooks = @($group["hooks"])
-        }
+        $originalHooks = @(ConvertTo-ArrayValue $group["hooks"])
+        $group["hooks"] = $originalHooks
 
         $remainingHooks = @()
         $removedRustHook = $false
@@ -195,10 +268,24 @@ function Merge-CodexHook {
     }
 
     $hooks = $document["hooks"]
-    $preToolUse = if (-not $hooks.Contains("PreToolUse") -or $null -eq $hooks["PreToolUse"]) { @() } else { @($hooks["PreToolUse"]) }
-    $userPromptSubmit = if (-not $hooks.Contains("UserPromptSubmit") -or $null -eq $hooks["UserPromptSubmit"]) { @() } else { @($hooks["UserPromptSubmit"]) }
-    $postToolUse = if (-not $hooks.Contains("PostToolUse") -or $null -eq $hooks["PostToolUse"]) { @() } else { @($hooks["PostToolUse"]) }
-    $stop = if (-not $hooks.Contains("Stop") -or $null -eq $hooks["Stop"]) { @() } else { @($hooks["Stop"]) }
+    $knownEvents = @(
+        "PreToolUse",
+        "PostToolUse",
+        "UserPromptSubmit",
+        "Stop",
+        "PermissionRequest"
+    )
+
+    foreach ($eventName in $knownEvents) {
+        if ($hooks.Contains($eventName)) {
+            $hooks[$eventName] = @(Normalize-HookGroups $hooks[$eventName])
+        }
+    }
+
+    $preToolUse = if ($hooks.Contains("PreToolUse")) { @(Normalize-HookGroups $hooks["PreToolUse"]) } else { @() }
+    $userPromptSubmit = if ($hooks.Contains("UserPromptSubmit")) { @(Normalize-HookGroups $hooks["UserPromptSubmit"]) } else { @() }
+    $postToolUse = if ($hooks.Contains("PostToolUse")) { @(Normalize-HookGroups $hooks["PostToolUse"]) } else { @() }
+    $stop = if ($hooks.Contains("Stop")) { @(Normalize-HookGroups $hooks["Stop"]) } else { @() }
 
     $mergedGroups = @(Remove-SlowcatchHooksFromGroups -Groups $preToolUse | Where-Object { $null -ne $_ })
 
@@ -258,6 +345,14 @@ function Merge-CodexHook {
     })
 
     $hooks["Stop"] = $stopGroups
+
+    foreach ($eventName in $knownEvents) {
+        if ($hooks.Contains($eventName)) {
+            $hooks[$eventName] = @(Normalize-HookGroups $hooks[$eventName])
+        }
+    }
+
+    Assert-CodexHooksSchema $document
 
     $parent = Split-Path -Parent $HooksPath
     if (-not (Test-Path -LiteralPath $parent)) {
