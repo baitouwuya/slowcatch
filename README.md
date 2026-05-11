@@ -23,7 +23,7 @@ Run the same command again to update.
 To pin a version:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((iwr https://raw.githubusercontent.com/baitouwuya/slowcatch/master/scripts/install-codex-hook.ps1 -UseB).Content)) -Version v0.1.2"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((iwr https://raw.githubusercontent.com/baitouwuya/slowcatch/master/scripts/install-codex-hook.ps1 -UseB).Content)) -Version v0.1.3"
 ```
 
 The installer downloads `slowcatch-x86_64-pc-windows-msvc.exe` from the latest
