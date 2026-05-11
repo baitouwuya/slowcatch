@@ -1,5 +1,8 @@
 mod mini;
 
+use crate::backends::directory::{
+    DirectoryList, DirectoryMatchField, DirectoryNameMatch, DirectoryPipeline,
+};
 use crate::backends::everything::FindQuery;
 use crate::backends::grep::{GrepContextQuery, GrepQuery};
 use crate::backends::projection::{
@@ -27,13 +30,26 @@ pub enum FastOperation {
         path: PathBuf,
         raw: bool,
     },
+    ReadLines {
+        path: PathBuf,
+        window: ReadWindow,
+        count: usize,
+    },
     Slice {
         path: PathBuf,
         skip: usize,
         first: usize,
     },
+    ListDirectory(DirectoryList),
+    ListDirectoryPipeline(DirectoryPipeline),
     CommandList(Vec<FastSegment>),
     MiniScript(MiniScript),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadWindow {
+    Head,
+    Tail,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,9 +132,21 @@ pub fn classify_powershell(command: &str, cwd: Option<&str>) -> ParseDecision {
     if let Some(operation) = parse_find_pipeline(trimmed, cwd) {
         return ParseDecision::Fast(operation);
     }
+    if let Some(operation) = parse_directory_pipeline(trimmed, cwd) {
+        return ParseDecision::Fast(operation);
+    }
     if let Some(operation) = parse_find_measure(trimmed, cwd) {
         return ParseDecision::Fast(operation);
     }
+
+    if let Some(operation) = parse_get_content_bounded(trimmed) {
+        return ParseDecision::Fast(operation);
+    }
+
+    if let Some(operation) = parse_get_child_item_local_list(trimmed, cwd) {
+        return ParseDecision::Fast(operation);
+    }
+
     if !is_valid_powershell_ast(trimmed) {
         if is_unknown_candidate(trimmed, first_command.as_deref()) {
             return unknown_candidate(trimmed, "invalid_or_unsupported_powershell_shape");
@@ -343,6 +371,9 @@ fn parse_get_child_item_find(command: &str, cwd: Option<&str>) -> Option<FastOpe
     }
 
     let parsed = parse_gci_options(&tokens[1..], cwd)?;
+    if parsed.names_only {
+        return None;
+    }
     if !parsed.recurse {
         return None;
     }
@@ -383,6 +414,12 @@ pub(super) fn classify_single_command(command: &str, cwd: Option<&str>) -> Parse
     if has_dynamic_or_unsafe_constructs(trimmed) {
         return ParseDecision::PassThrough(PassThroughReason::DynamicOrUnsafe);
     }
+    if let Some(operation) = parse_get_content_bounded(trimmed) {
+        return ParseDecision::Fast(operation);
+    }
+    if let Some(operation) = parse_get_child_item_local_list(trimmed, cwd) {
+        return ParseDecision::Fast(operation);
+    }
     if !is_valid_powershell_ast(trimmed) {
         return unknown_candidate(trimmed, "invalid_or_unsupported_powershell_shape");
     }
@@ -398,10 +435,10 @@ pub(super) fn classify_single_command(command: &str, cwd: Option<&str>) -> Parse
     if let Some(operation) = parse_find_pipeline(trimmed, cwd) {
         return ParseDecision::Fast(operation);
     }
-    if let Some(operation) = parse_find_measure(trimmed, cwd) {
+    if let Some(operation) = parse_directory_pipeline(trimmed, cwd) {
         return ParseDecision::Fast(operation);
     }
-    if let Some(operation) = parse_get_child_item_list(trimmed, cwd) {
+    if let Some(operation) = parse_find_measure(trimmed, cwd) {
         return ParseDecision::Fast(operation);
     }
     if let Some(operation) = parse_select_string(trimmed, cwd) {
@@ -531,13 +568,13 @@ fn parse_get_content_inspect_options(tokens: &[String]) -> Option<InspectOptions
             "-raw" => raw = true,
             "-path" | "-literalpath" => {
                 index += 1;
-                path = tokens.get(index).cloned();
+                path = tokens.get(index).and_then(|value| expand_env_path(value));
             }
             "-readcount" | "-totalcount" | "-tail" | "-wait" => return None,
             value if value.starts_with("-path:") || value.starts_with("-literalpath:") => {
                 path = tokens[index]
                     .split_once(':')
-                    .map(|(_, value)| value.to_string());
+                    .and_then(|(_, value)| expand_env_path(value));
             }
             value if value.starts_with('-') => return None,
             _ => positional.push(tokens[index].clone()),
@@ -545,12 +582,89 @@ fn parse_get_content_inspect_options(tokens: &[String]) -> Option<InspectOptions
         index += 1;
     }
     if path.is_none() && positional.len() == 1 {
-        path = positional.pop();
+        path = positional.pop().and_then(|value| expand_env_path(&value));
     }
     if !positional.is_empty() {
         return None;
     }
     Some(InspectOptions { path: path?, raw })
+}
+
+fn parse_get_content_bounded(command: &str) -> Option<FastOperation> {
+    if command.contains('|') {
+        return None;
+    }
+    let tokens = tokenize(command)?;
+    let command_name = tokens.first()?.to_lowercase();
+    if !matches!(command_name.as_str(), "get-content" | "gc" | "cat" | "type") {
+        return None;
+    }
+    let parsed = parse_get_content_bounded_options(&tokens[1..])?;
+    Some(FastOperation::ReadLines {
+        path: PathBuf::from(parsed.path),
+        window: parsed.window,
+        count: parsed.count,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundedReadOptions {
+    path: String,
+    window: ReadWindow,
+    count: usize,
+}
+
+fn parse_get_content_bounded_options(tokens: &[String]) -> Option<BoundedReadOptions> {
+    let mut path = None;
+    let mut window = None;
+    let mut count = None;
+    let mut positional = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        match tokens[index].to_lowercase().as_str() {
+            "-totalcount" => {
+                if window.is_some() {
+                    return None;
+                }
+                index += 1;
+                window = Some(ReadWindow::Head);
+                count = Some(tokens.get(index)?.parse().ok()?);
+            }
+            "-tail" => {
+                if window.is_some() {
+                    return None;
+                }
+                index += 1;
+                window = Some(ReadWindow::Tail);
+                count = Some(tokens.get(index)?.parse().ok()?);
+            }
+            "-path" | "-literalpath" => {
+                index += 1;
+                path = tokens.get(index).and_then(|value| expand_env_path(value));
+            }
+            "-erroraction" | "-ea" => index += 1,
+            "-raw" | "-readcount" | "-wait" => return None,
+            value if value.starts_with("-path:") || value.starts_with("-literalpath:") => {
+                path = tokens[index]
+                    .split_once(':')
+                    .and_then(|(_, value)| expand_env_path(value));
+            }
+            value if value.starts_with('-') => return None,
+            _ => positional.push(tokens[index].clone()),
+        }
+        index += 1;
+    }
+    if path.is_none() && positional.len() == 1 {
+        path = expand_env_path(&positional.remove(0));
+    }
+    if !positional.is_empty() {
+        return None;
+    }
+    Some(BoundedReadOptions {
+        path: path?,
+        window: window?,
+        count: count?,
+    })
 }
 
 fn parse_get_content_slice(command: &str) -> Option<FastOperation> {
@@ -630,6 +744,9 @@ fn parse_gci_select_string_pipeline(command: &str, cwd: Option<&str>) -> Option<
     }
 
     let parsed = parse_gci_options(&left[1..], cwd)?;
+    if parsed.names_only {
+        return None;
+    }
     if !parsed.recurse {
         return None;
     }
@@ -678,6 +795,9 @@ fn parse_find_projection(command: &str, cwd: Option<&str>) -> Option<FastOperati
         return None;
     }
     let parsed = parse_gci_options(&left[1..], cwd)?;
+    if parsed.names_only {
+        return None;
+    }
     let projection = parse_select_projection(&select[1..])?;
     if !parsed.recurse
         && parsed.roots.len() > 1
@@ -721,6 +841,9 @@ fn parse_find_pipeline(command: &str, cwd: Option<&str>) -> Option<FastOperation
         return None;
     }
     let parsed = parse_gci_options(&left[1..], cwd)?;
+    if parsed.names_only {
+        return None;
+    }
     let mut where_filter = None;
     let mut sort = None;
     let mut projection = None;
@@ -772,6 +895,49 @@ fn parse_find_pipeline(command: &str, cwd: Option<&str>) -> Option<FastOperation
     }))
 }
 
+fn parse_directory_pipeline(command: &str, cwd: Option<&str>) -> Option<FastOperation> {
+    let parts = split_pipeline(command)?;
+    if parts.len() != 3 {
+        return None;
+    }
+    let left = tokenize(parts[0])?;
+    let where_tokens = tokenize(parts[1])?;
+    let select_tokens = tokenize(parts[2])?;
+    let left_name = left.first()?.to_lowercase();
+    let where_name = where_tokens.first()?.to_lowercase();
+    let select_name = select_tokens.first()?.to_lowercase();
+    if !matches!(left_name.as_str(), "get-childitem" | "gci" | "dir" | "ls")
+        || !matches!(where_name.as_str(), "where-object" | "where" | "?")
+        || !matches!(select_name.as_str(), "select-object" | "select")
+    {
+        return None;
+    }
+
+    let parsed = parse_gci_options(&left[1..], cwd)?;
+    if parsed.recurse
+        || !parsed.directories_only
+        || parsed.names_only
+        || parsed.files_only
+        || parsed.include.is_some()
+        || parsed.roots.len() > 1
+    {
+        return None;
+    }
+    let name_match = parse_directory_match_filter(&where_tokens[1..])?;
+    let projection = parse_select_projection(&select_tokens[1..])?;
+    Some(FastOperation::ListDirectoryPipeline(DirectoryPipeline {
+        list: DirectoryList {
+            root: PathBuf::from(parsed.roots.into_iter().next()?),
+            filter: parsed.filter,
+            names_only: false,
+            files_only: false,
+            directories_only: true,
+        },
+        name_match: Some(name_match),
+        projection,
+    }))
+}
+
 fn parse_find_measure(command: &str, cwd: Option<&str>) -> Option<FastOperation> {
     let parts = split_pipeline(command)?;
     if !(parts.len() == 2 || parts.len() == 3) {
@@ -783,6 +949,9 @@ fn parse_find_measure(command: &str, cwd: Option<&str>) -> Option<FastOperation>
         return None;
     }
     let parsed = parse_gci_options(&left[1..], cwd)?;
+    if parsed.names_only {
+        return None;
+    }
     let (where_filter, measure_part) = if parts.len() == 3 {
         let where_tokens = tokenize(parts[1])?;
         let where_name = where_tokens.first()?.to_lowercase();
@@ -816,7 +985,7 @@ fn parse_find_measure(command: &str, cwd: Option<&str>) -> Option<FastOperation>
     }))
 }
 
-fn parse_get_child_item_list(command: &str, cwd: Option<&str>) -> Option<FastOperation> {
+fn parse_get_child_item_local_list(command: &str, cwd: Option<&str>) -> Option<FastOperation> {
     if command.contains('|') {
         return None;
     }
@@ -829,15 +998,15 @@ fn parse_get_child_item_list(command: &str, cwd: Option<&str>) -> Option<FastOpe
         return None;
     }
     let parsed = parse_gci_options(&tokens[1..], cwd)?;
-    let pattern = parsed.filter.or(parsed.include)?;
-    Some(FastOperation::FindProjection(FindProjection {
-        query: FindQuery {
-            root: parsed.roots.into_iter().next(),
-            pattern,
-            files_only: true,
-            limit: 200,
-        },
-        projection: Projection::FullNameOnly,
+    if parsed.recurse || parsed.include.is_some() || parsed.roots.len() > 1 {
+        return None;
+    }
+    Some(FastOperation::ListDirectory(DirectoryList {
+        root: PathBuf::from(parsed.roots.into_iter().next()?),
+        filter: parsed.filter,
+        names_only: parsed.names_only,
+        files_only: parsed.files_only,
+        directories_only: parsed.directories_only,
     }))
 }
 
@@ -847,6 +1016,9 @@ struct GciOptions {
     filter: Option<String>,
     include: Option<String>,
     recurse: bool,
+    names_only: bool,
+    files_only: bool,
+    directories_only: bool,
 }
 
 fn parse_gci_options(tokens: &[String], cwd: Option<&str>) -> Option<GciOptions> {
@@ -856,11 +1028,14 @@ fn parse_gci_options(tokens: &[String], cwd: Option<&str>) -> Option<GciOptions>
     while index < tokens.len() {
         match tokens[index].to_lowercase().as_str() {
             "-recurse" | "-r" => options.recurse = true,
-            "-file" | "-force" | "/a-d" => {}
+            "-file" | "/a-d" => options.files_only = true,
+            "-directory" | "/ad" => options.directories_only = true,
+            "-force" => {}
+            "-name" => options.names_only = true,
             "-path" | "-literalpath" => {
                 index += 1;
                 if let Some(value) = tokens.get(index) {
-                    options.roots.extend(split_argument_list(value));
+                    options.roots.extend(split_argument_list(value)?);
                     index = consume_path_list_tail(tokens, index + 1, &mut options.roots);
                     continue;
                 }
@@ -874,10 +1049,9 @@ fn parse_gci_options(tokens: &[String], cwd: Option<&str>) -> Option<GciOptions>
                 options.include = tokens.get(index).cloned();
             }
             "-erroraction" | "-ea" => index += 1,
-            "-directory" | "/ad" => return None,
             value if value.starts_with("-path:") || value.starts_with("-literalpath:") => {
                 if let Some((_, value)) = tokens[index].split_once(':') {
-                    options.roots.extend(split_argument_list(value));
+                    options.roots.extend(split_argument_list(value)?);
                     index = consume_path_list_tail(tokens, index + 1, &mut options.roots);
                     continue;
                 }
@@ -893,7 +1067,7 @@ fn parse_gci_options(tokens: &[String], cwd: Option<&str>) -> Option<GciOptions>
                     .map(|(_, value)| value.to_string());
             }
             value if value.starts_with('-') => return None,
-            _ => positional.extend(split_argument_list(&tokens[index])),
+            _ => positional.extend(split_argument_list(&tokens[index])?),
         }
         index += 1;
     }
@@ -910,11 +1084,11 @@ fn parse_gci_options(tokens: &[String], cwd: Option<&str>) -> Option<GciOptions>
     Some(options)
 }
 
-fn split_argument_list(value: &str) -> Vec<String> {
+fn split_argument_list(value: &str) -> Option<Vec<String>> {
     value
         .split(',')
         .map(clean_path_fragment)
-        .filter(|part| !part.is_empty())
+        .filter(|part| part.as_deref().is_some_and(|part| !part.is_empty()))
         .collect()
 }
 
@@ -935,7 +1109,9 @@ fn consume_path_list_tail(tokens: &[String], mut index: usize, roots: &mut Vec<S
             break;
         }
         if pending_separator || token.starts_with(',') {
-            roots.extend(split_argument_list(token));
+            if let Some(paths) = split_argument_list(token) {
+                roots.extend(paths);
+            }
             pending_separator = false;
             index += 1;
             continue;
@@ -945,7 +1121,7 @@ fn consume_path_list_tail(tokens: &[String], mut index: usize, roots: &mut Vec<S
     index
 }
 
-fn clean_path_fragment(value: &str) -> String {
+fn clean_path_fragment(value: &str) -> Option<String> {
     let mut fragment = value.trim().trim_start_matches(',');
     fragment = fragment.trim();
     if (fragment.starts_with('"') && fragment.ends_with('"'))
@@ -953,7 +1129,7 @@ fn clean_path_fragment(value: &str) -> String {
     {
         fragment = &fragment[1..fragment.len() - 1];
     }
-    fragment.to_string()
+    expand_env_path(fragment)
 }
 
 fn parse_select_string_pattern(tokens: &[String]) -> Option<String> {
@@ -1106,6 +1282,30 @@ fn parse_where_object_filter(tokens: &[String]) -> Option<FileWhere> {
     }
 }
 
+fn parse_directory_match_filter(tokens: &[String]) -> Option<DirectoryNameMatch> {
+    let tokens = unwrap_braced_tokens(tokens);
+    if tokens.len() != 3 {
+        return None;
+    }
+    let field = match tokens[0]
+        .trim_start_matches("$_.")
+        .trim_start_matches('.')
+        .to_lowercase()
+        .as_str()
+    {
+        "name" => DirectoryMatchField::Name,
+        "fullname" | "full_name" => DirectoryMatchField::FullName,
+        _ => return None,
+    };
+    if !tokens[1].eq_ignore_ascii_case("-match") {
+        return None;
+    }
+    Some(DirectoryNameMatch {
+        field,
+        pattern: tokens[2].clone(),
+    })
+}
+
 fn parse_sort_object(tokens: &[String]) -> Option<FileSort> {
     let mut field = None;
     let mut descending = false;
@@ -1234,13 +1434,13 @@ fn parse_get_content_path(tokens: &[String]) -> Option<String> {
         match tokens[index].to_lowercase().as_str() {
             "-path" | "-literalpath" => {
                 index += 1;
-                return tokens.get(index).cloned();
+                return tokens.get(index).and_then(|value| expand_env_path(value));
             }
             "-raw" | "-readcount" | "-totalcount" | "-tail" | "-wait" => return None,
             value if value.starts_with("-path:") || value.starts_with("-literalpath:") => {
                 return tokens[index]
                     .split_once(':')
-                    .map(|(_, value)| value.to_string());
+                    .and_then(|(_, value)| expand_env_path(value));
             }
             value if value.starts_with('-') => return None,
             _ => positional.push(tokens[index].clone()),
@@ -1248,10 +1448,39 @@ fn parse_get_content_path(tokens: &[String]) -> Option<String> {
         index += 1;
     }
     if positional.len() == 1 {
-        positional.into_iter().next()
+        positional
+            .into_iter()
+            .next()
+            .and_then(|value| expand_env_path(&value))
     } else {
         None
     }
+}
+
+fn expand_env_path(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if !lower.starts_with("$env:") {
+        return Some(trimmed.to_string());
+    }
+
+    let rest = &trimmed[5..];
+    let split_at = rest
+        .char_indices()
+        .find_map(|(index, character)| matches!(character, '\\' | '/').then_some(index))
+        .unwrap_or(rest.len());
+    let name = &rest[..split_at];
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return None;
+    }
+    let suffix = &rest[split_at..];
+    std::env::var(name)
+        .ok()
+        .map(|value| format!("{value}{suffix}"))
 }
 
 fn parse_select_object_window(tokens: &[String]) -> Option<(usize, usize)> {
@@ -1417,6 +1646,43 @@ mod tests {
     }
 
     #[test]
+    fn parses_get_content_totalcount_as_bounded_head_read() {
+        let operation = parse_powershell(
+            "Get-Content -LiteralPath 'C:\\repo\\file.txt' -TotalCount 20",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            operation,
+            FastOperation::ReadLines {
+                path: PathBuf::from("C:\\repo\\file.txt"),
+                window: ReadWindow::Head,
+                count: 20,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_get_content_tail_with_env_path_and_error_action() {
+        let temp = std::env::var("TEMP").unwrap_or_else(|_| "C:\\Temp".to_string());
+        let operation = parse_powershell(
+            "Get-Content -Path $env:TEMP\\log.txt -Tail 80 -ErrorAction SilentlyContinue",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            operation,
+            FastOperation::ReadLines {
+                path: PathBuf::from(format!("{temp}\\log.txt")),
+                window: ReadWindow::Tail,
+                count: 80,
+            }
+        );
+    }
+
+    #[test]
     fn fail_opens_for_mutating_commands() {
         assert!(parse_powershell("Remove-Item C:\\repo -Recurse", Some("C:\\repo")).is_none());
     }
@@ -1527,6 +1793,52 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn parses_local_get_child_item_listing_forms() {
+        let decision = classify_powershell("Get-ChildItem -Force", Some("C:\\repo"));
+        let ParseDecision::Fast(FastOperation::ListDirectory(listing)) = decision else {
+            panic!("unexpected decision: {decision:?}");
+        };
+        assert_eq!(listing.root, PathBuf::from("C:\\repo"));
+        assert!(!listing.names_only);
+
+        let decision = classify_powershell("Get-ChildItem -Force -Name", Some("C:\\repo"));
+        let ParseDecision::Fast(FastOperation::ListDirectory(listing)) = decision else {
+            panic!("unexpected decision: {decision:?}");
+        };
+        assert_eq!(listing.root, PathBuf::from("C:\\repo"));
+        assert!(listing.names_only);
+    }
+
+    #[test]
+    fn parses_non_recursive_filtered_get_child_item_as_local_listing() {
+        let decision = classify_powershell(
+            "Get-ChildItem -LiteralPath 'C:\\repo' -Filter '*.uid'",
+            Some("C:\\fallback"),
+        );
+        let ParseDecision::Fast(FastOperation::ListDirectory(listing)) = decision else {
+            panic!("unexpected decision: {decision:?}");
+        };
+        assert_eq!(listing.root, PathBuf::from("C:\\repo"));
+        assert_eq!(listing.filter.as_deref(), Some("*.uid"));
+    }
+
+    #[test]
+    fn parses_local_directory_match_projection_pipeline() {
+        let temp = std::env::var("TEMP").unwrap_or_else(|_| "C:\\Temp".to_string());
+        let decision = classify_powershell(
+            r#"Get-ChildItem -Path "$env:TEMP" -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'View3D' } | Select-Object FullName,LastWriteTime"#,
+            Some("C:\\fallback"),
+        );
+        let ParseDecision::Fast(FastOperation::ListDirectoryPipeline(pipeline)) = decision else {
+            panic!("unexpected decision: {decision:?}");
+        };
+        assert_eq!(pipeline.list.root, PathBuf::from(temp));
+        assert!(pipeline.list.directories_only);
+        assert!(pipeline.name_match.is_some());
+        assert!(matches!(pipeline.projection, Projection::Metadata { .. }));
     }
 
     #[test]

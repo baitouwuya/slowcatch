@@ -129,42 +129,11 @@ function New-HookCommand {
     return "$ExePath hook codex"
 }
 
-function Merge-CodexHook {
-    param(
-        [string]$HooksPath,
-        [string]$ExePath
-    )
-
-    if (Test-Path -LiteralPath $HooksPath) {
-        $raw = Read-Utf8TextNoBom $HooksPath
-        if ([string]::IsNullOrWhiteSpace($raw)) {
-            $document = [ordered]@{}
-        } else {
-            try {
-                $document = ConvertTo-Hashtable ($raw | ConvertFrom-Json)
-            } catch {
-                $backupPath = Backup-InvalidHooksJson $HooksPath
-                Write-Warning "Existing hooks.json is not valid JSON. Backed it up to $backupPath and created a fresh hooks.json."
-                $document = [ordered]@{}
-            }
-        }
-    } else {
-        $document = [ordered]@{}
-    }
-
-    if (-not $document.Contains("hooks") -or $null -eq $document["hooks"]) {
-        $document["hooks"] = [ordered]@{}
-    }
-
-    $hooks = $document["hooks"]
-    if (-not $hooks.Contains("PreToolUse") -or $null -eq $hooks["PreToolUse"]) {
-        $preToolUse = @()
-    } else {
-        $preToolUse = @($hooks["PreToolUse"])
-    }
+function Remove-SlowcatchHooksFromGroups {
+    param($Groups)
 
     $mergedGroups = @()
-    foreach ($group in $preToolUse) {
+    foreach ($group in @($Groups)) {
         if ($null -eq $group -or -not ($group -is [System.Collections.IDictionary])) {
             $mergedGroups += ,$group
             continue
@@ -195,19 +164,100 @@ function Merge-CodexHook {
         }
     }
 
-    $mergedGroups += ,[ordered]@{
+    return $mergedGroups
+}
+
+function Merge-CodexHook {
+    param(
+        [string]$HooksPath,
+        [string]$ExePath
+    )
+
+    if (Test-Path -LiteralPath $HooksPath) {
+        $raw = Read-Utf8TextNoBom $HooksPath
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            $document = [ordered]@{}
+        } else {
+            try {
+                $document = ConvertTo-Hashtable ($raw | ConvertFrom-Json)
+            } catch {
+                $backupPath = Backup-InvalidHooksJson $HooksPath
+                Write-Warning "Existing hooks.json is not valid JSON. Backed it up to $backupPath and created a fresh hooks.json."
+                $document = [ordered]@{}
+            }
+        }
+    } else {
+        $document = [ordered]@{}
+    }
+
+    if (-not $document.Contains("hooks") -or $null -eq $document["hooks"]) {
+        $document["hooks"] = [ordered]@{}
+    }
+
+    $hooks = $document["hooks"]
+    $preToolUse = if (-not $hooks.Contains("PreToolUse") -or $null -eq $hooks["PreToolUse"]) { @() } else { @($hooks["PreToolUse"]) }
+    $userPromptSubmit = if (-not $hooks.Contains("UserPromptSubmit") -or $null -eq $hooks["UserPromptSubmit"]) { @() } else { @($hooks["UserPromptSubmit"]) }
+    $postToolUse = if (-not $hooks.Contains("PostToolUse") -or $null -eq $hooks["PostToolUse"]) { @() } else { @($hooks["PostToolUse"]) }
+    $stop = if (-not $hooks.Contains("Stop") -or $null -eq $hooks["Stop"]) { @() } else { @($hooks["Stop"]) }
+
+    $mergedGroups = @(Remove-SlowcatchHooksFromGroups -Groups $preToolUse | Where-Object { $null -ne $_ })
+
+    $mergedGroups += ,([ordered]@{
         matcher = "^Bash$"
         hooks = @(
             [ordered]@{
                 type = "command"
-                command = New-HookCommand $ExePath
+                command = (New-HookCommand $ExePath)
                 timeout = 15
                 statusMessage = "Checking slowcatch fast-path"
             }
         )
-    }
+    })
 
     $hooks["PreToolUse"] = $mergedGroups
+
+    $promptGroups = @(Remove-SlowcatchHooksFromGroups -Groups $userPromptSubmit | Where-Object { $null -ne $_ })
+    $promptGroups += ,([ordered]@{
+        hooks = @(
+            [ordered]@{
+                type = "command"
+                command = (New-HookCommand $ExePath)
+                timeout = 10
+                statusMessage = "Looking up prompt references"
+            }
+        )
+    })
+
+    $hooks["UserPromptSubmit"] = $promptGroups
+
+    $postGroups = @(Remove-SlowcatchHooksFromGroups -Groups $postToolUse | Where-Object { $null -ne $_ })
+    $postGroups += ,([ordered]@{
+        matcher = "^apply_patch$|^Edit$|^Write$"
+        hooks = @(
+            [ordered]@{
+                type = "command"
+                command = (New-HookCommand $ExePath)
+                timeout = 10
+                statusMessage = "Checking edited files"
+            }
+        )
+    })
+
+    $hooks["PostToolUse"] = $postGroups
+
+    $stopGroups = @(Remove-SlowcatchHooksFromGroups -Groups $stop | Where-Object { $null -ne $_ })
+    $stopGroups += ,([ordered]@{
+        hooks = @(
+            [ordered]@{
+                type = "command"
+                command = (New-HookCommand $ExePath)
+                timeout = 25
+                statusMessage = "Checking project diagnostics"
+            }
+        )
+    })
+
+    $hooks["Stop"] = $stopGroups
 
     $parent = Split-Path -Parent $HooksPath
     if (-not (Test-Path -LiteralPath $parent)) {

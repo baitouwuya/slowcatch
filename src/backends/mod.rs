@@ -1,3 +1,4 @@
+pub mod directory;
 pub mod everything;
 pub mod grep;
 pub mod inspect_file;
