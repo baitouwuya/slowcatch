@@ -193,6 +193,18 @@ function Assert-CodexHooksSchema {
     }
 }
 
+function Normalize-AllHookEvents {
+    param($Hooks)
+
+    if ($null -eq $Hooks -or -not ($Hooks -is [System.Collections.IDictionary])) {
+        return
+    }
+
+    foreach ($eventName in @($Hooks.Keys)) {
+        $Hooks[$eventName] = @(Normalize-HookGroups $Hooks[$eventName])
+    }
+}
+
 function New-HookCommand {
     param([string]$ExePath)
 
@@ -268,19 +280,7 @@ function Merge-CodexHook {
     }
 
     $hooks = $document["hooks"]
-    $knownEvents = @(
-        "PreToolUse",
-        "PostToolUse",
-        "UserPromptSubmit",
-        "Stop",
-        "PermissionRequest"
-    )
-
-    foreach ($eventName in $knownEvents) {
-        if ($hooks.Contains($eventName)) {
-            $hooks[$eventName] = @(Normalize-HookGroups $hooks[$eventName])
-        }
-    }
+    Normalize-AllHookEvents $hooks
 
     $preToolUse = if ($hooks.Contains("PreToolUse")) { @(Normalize-HookGroups $hooks["PreToolUse"]) } else { @() }
     $userPromptSubmit = if ($hooks.Contains("UserPromptSubmit")) { @(Normalize-HookGroups $hooks["UserPromptSubmit"]) } else { @() }
@@ -346,11 +346,7 @@ function Merge-CodexHook {
 
     $hooks["Stop"] = $stopGroups
 
-    foreach ($eventName in $knownEvents) {
-        if ($hooks.Contains($eventName)) {
-            $hooks[$eventName] = @(Normalize-HookGroups $hooks[$eventName])
-        }
-    }
+    Normalize-AllHookEvents $hooks
 
     Assert-CodexHooksSchema $document
 
